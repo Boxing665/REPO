@@ -1,0 +1,4 @@
+{
+  "build_command": "npm install --production",
+  "start_command": "node server.js"
+}
