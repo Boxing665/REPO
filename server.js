@@ -2,14 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const app = express();
 
-// 1. 允許跨網域請求
-app.use(cors({
-  origin: ['https://pangpangsport.zeabur.app', 'http://localhost:3000', 'http://localhost:8080'],
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type'],
-  credentials: true,
-}));
-app.options('*', cors());
+// 1. 允許跨網域請求（讓你的前端網頁可以連進來）
+app.use(cors());
 
 // 2. 讓後端可以解析前端傳過來的 JSON 資料
 app.use(express.json());
