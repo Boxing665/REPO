@@ -119,12 +119,11 @@ router.post('/predict', async (req, res) => {
 
     if (!records || records.length === 0) {
       const [rows] = await pool.query(
-        'SELECT draw_no, numbers, draw_time FROM lottery_539 ORDER BY draw_no DESC LIMIT 80'
+        'SELECT draw_date, numbers FROM lottery_draws_539 ORDER BY id DESC LIMIT 80'
       );
       records = rows.map(r => ({
-        drawNo: r.draw_no,
-        numbers: JSON.parse(r.numbers),
-        drawTime: r.draw_time,
+        drawDate: r.draw_date,
+        numbers:  Array.isArray(r.numbers) ? r.numbers : JSON.parse(r.numbers),
       }));
     }
 
@@ -140,11 +139,19 @@ router.post('/predict', async (req, res) => {
     const sorted = scoreArr.map((v, i) => [i, v]).slice(1).sort((a, b) => b[1] - a[1]);
     const recommended = sorted.slice(0, count).map(([n]) => n).sort((a, b) => a - b);
 
-    const nextDrawNo = (records[0]?.drawNo || 0) + 1;
+    const nextDrawDate = records[0]?.drawDate || '';
+
+    // 儲存本次預測到 DB（用 IGNORE 避免重複）
+    if (nextDrawDate) {
+      pool.execute(
+        'INSERT IGNORE INTO lottery_539_prediction_results (draw_date, predicted_numbers) VALUES (?,?)',
+        [nextDrawDate + '_next', JSON.stringify(recommended)]
+      ).catch(() => {});
+    }
 
     res.json({
       recommended,
-      nextDrawNo,
+      nextDrawDate,
       analyzedDraws: N,
       baseScores,
       stats: Object.fromEntries(Object.entries(stats).map(([k, v]) => [k, {
@@ -158,4 +165,7 @@ router.post('/predict', async (req, res) => {
   }
 });
 
+// ── 匯出核心函式供 server.js cron 和 analysis.js 使用 ────────────────────────
+router.buildLotteryStats = buildLotteryStats;
+router.scoreNumbers      = scoreNumbers;
 module.exports = router;

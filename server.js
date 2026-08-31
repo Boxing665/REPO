@@ -116,8 +116,10 @@ app.use(generalLimit);
 // ── 分析路由（業務邏輯後端化）───────────────────────────────────
 const bingoAnalyzeRouter   = require('./routes/bingo_analyze');
 const lotteryPredictRouter = require('./routes/lottery_predict');
+const analysisRouter       = require('./routes/analysis');
 app.use('/api/bingo',          bingoAnalyzeRouter);
 app.use('/api/lottery/539',    lotteryPredictRouter);
+app.use('/api/analysis',       analysisRouter);
 
 // ── Admin Key + HMAC 簽章驗證 middleware ────────────────────────
 // 請求端需附帶：
@@ -1445,29 +1447,268 @@ cron.schedule('0 3 * * *', async () => {
   console.log('🧹 過期快取已清除');
 }, { timezone: 'Asia/Taipei' });
 
-cron.schedule('*/5 * * * *', async () => {
-  try {
-    const data = await new Promise((resolve) => {
-      const postData = JSON.stringify({ count: 10 });
-      const req = require('http').request(
-        { hostname: 'bingo.kuaishou1688.com', path: '/api/get_data', method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Content-Length': postData.length } },
-        (res) => { let b = ''; res.on('data', c => b += c); res.on('end', () => { try { resolve(JSON.parse(b)); } catch { resolve(null); } }); }
+// ════════════════════════════════════════════════════════════════
+// 賓果統計分析工具函式
+// ════════════════════════════════════════════════════════════════
+
+/** 從 bingo.kuaishou1688.com 抓取最新一批開獎 */
+async function fetchBingoData(count = 10) {
+  return new Promise((resolve) => {
+    const postData = JSON.stringify({ count });
+    const req = require('http').request(
+      { hostname: 'bingo.kuaishou1688.com', path: '/api/get_data', method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': postData.length } },
+      (res) => { let b = ''; res.on('data', c => b += c); res.on('end', () => { try { resolve(JSON.parse(b)); } catch { resolve(null); } }); }
+    );
+    req.on('error', () => resolve(null));
+    req.setTimeout(8000, () => { req.destroy(); resolve(null); });
+    req.write(postData); req.end();
+  });
+}
+
+/** 增量更新賓果轉移矩陣（前一期 prevNums → 當期 curNums） */
+async function updateBingoTransition(prevNums, curNums) {
+  if (!prevNums || prevNums.length === 0) return;
+  const pairs = [];
+  for (const f of prevNums) for (const t of curNums) pairs.push([f, t]);
+  for (const chunk of [pairs]) {
+    if (chunk.length === 0) continue;
+    const placeholders = chunk.map(() => '(?,?,1)').join(',');
+    const vals = chunk.flat();
+    await pool.execute(
+      `INSERT INTO bingo_transition_matrix (from_num, to_num, count) VALUES ${placeholders}
+       ON DUPLICATE KEY UPDATE count = count + 1`,
+      vals
+    );
+  }
+  // 更新機率
+  const froms = [...new Set(prevNums)];
+  for (const f of froms) {
+    const [[row]] = await pool.query(
+      'SELECT SUM(count) as total FROM bingo_transition_matrix WHERE from_num=?', [f]
+    );
+    if (row.total > 0) {
+      await pool.execute(
+        'UPDATE bingo_transition_matrix SET probability = count / ? WHERE from_num = ?',
+        [row.total, f]
       );
-      req.on('error', () => resolve(null));
-      req.write(postData); req.end();
-    });
-    if (data?.success && Array.isArray(data.data)) {
-      for (const item of data.data) {
-        const nums = (item['一般獎號'] || []).map(n => parseInt(n)).filter(n => n >= 1 && n <= 80).sort((a,b)=>a-b);
-        if (nums.length < 15) continue;
-        await pool.execute(
-          `INSERT IGNORE INTO bingo_draws (draw_no, numbers, draw_time) VALUES (?,?,?)`,
-          [parseInt(item['期數']), json(nums), item['開獎日期'] ? `${item['開獎日期']} ${item['開獎時間']}` : null]
-        ).catch(() => {});
-      }
     }
-  } catch (_) {}
+  }
+}
+
+/** 增量更新賓果共現矩陣 */
+async function updateBingoCooccurrence(nums) {
+  const sorted = [...nums].sort((a, b) => a - b);
+  const pairs  = [];
+  for (let i = 0; i < sorted.length; i++)
+    for (let j = i + 1; j < sorted.length; j++)
+      pairs.push([sorted[i], sorted[j]]);
+  if (pairs.length === 0) return;
+  const placeholders = pairs.map(() => '(?,?,1)').join(',');
+  await pool.execute(
+    `INSERT INTO bingo_cooccurrence (num_a, num_b, count) VALUES ${placeholders}
+     ON DUPLICATE KEY UPDATE count = count + 1`,
+    pairs.flat()
+  );
+}
+
+/** 增量更新賓果號碼統計 */
+async function updateBingoNumberStats(newNums, drawNo) {
+  const numSet = new Set(newNums);
+  const drawn  = [];
+  const missed = [];
+  for (let n = 1; n <= 80; n++) (numSet.has(n) ? drawn : missed).push(n);
+
+  // 被開出的號碼：重置 miss，++times_drawn
+  if (drawn.length > 0) {
+    await pool.execute(
+      `UPDATE bingo_number_stats
+       SET times_drawn  = times_drawn + 1,
+           max_miss     = GREATEST(max_miss, current_miss),
+           current_miss = 0,
+           last_drawn_no = ?,
+           total_draws  = total_draws + 1
+       WHERE number IN (${drawn.map(() => '?').join(',')})`,
+      [drawNo, ...drawn]
+    );
+  }
+  // 未開出的號碼：++miss
+  if (missed.length > 0) {
+    await pool.execute(
+      `UPDATE bingo_number_stats
+       SET current_miss = current_miss + 1,
+           max_miss     = GREATEST(max_miss, current_miss + 1),
+           total_draws  = total_draws + 1
+       WHERE number IN (${missed.map(() => '?').join(',')})`,
+      missed
+    );
+  }
+}
+
+/** 從頭重建所有賓果分析表（啟動時或手動觸發） */
+async function rebuildBingoAnalysis() {
+  const [draws] = await pool.query(
+    'SELECT draw_no, numbers FROM bingo_draws ORDER BY draw_no ASC'
+  );
+  if (draws.length === 0) { console.log('⚠️ bingo_draws 無資料，跳過 rebuild'); return; }
+
+  const parsed   = draws.map(r => ({ drawNo: r.draw_no, numbers: Array.isArray(r.numbers)?r.numbers:JSON.parse(r.numbers) }));
+  const total    = parsed.length;
+
+  // 清空並初始化
+  await pool.execute('DELETE FROM bingo_number_stats');
+  await pool.execute('DELETE FROM bingo_transition_matrix');
+  await pool.execute('DELETE FROM bingo_cooccurrence');
+  const initVals = Array.from({ length: 80 }, (_, i) => [i + 1, 0, 0, 0, null, 0]);
+  await pool.query(
+    'INSERT INTO bingo_number_stats (number, times_drawn, current_miss, max_miss, last_drawn_no, total_draws) VALUES ?',
+    [initVals]
+  );
+
+  // 計算 number_stats（單次掃描 O(draws × 80)）
+  const nd = {};
+  for (let n = 1; n <= 80; n++) nd[n] = { td: 0, cm: 0, mm: 0, ld: null, run: 0 };
+  for (const { drawNo, numbers } of parsed) {
+    const ns = new Set(numbers);
+    for (let n = 1; n <= 80; n++) {
+      const d = nd[n];
+      if (ns.has(n)) { d.td++; if (d.run > d.mm) d.mm = d.run; d.run = 0; d.ld = drawNo; }
+      else           { d.run++; }
+    }
+  }
+  await Promise.all(Array.from({ length: 80 }, (_, i) => i + 1).map(n => {
+    const d = nd[n]; const cm = d.run; if (cm > d.mm) d.mm = cm;
+    return pool.execute(
+      'UPDATE bingo_number_stats SET times_drawn=?,current_miss=?,max_miss=?,last_drawn_no=?,total_draws=? WHERE number=?',
+      [d.td, cm, d.mm, d.ld, total, n]
+    );
+  }));
+
+  // 計算 transition_matrix
+  const transMap = {};
+  for (let i = 1; i < parsed.length; i++) {
+    for (const f of parsed[i - 1].numbers) {
+      if (!transMap[f]) transMap[f] = {};
+      for (const t of parsed[i].numbers)
+        transMap[f][t] = (transMap[f][t] || 0) + 1;
+    }
+  }
+  const transRows = [];
+  for (const [f, toMap] of Object.entries(transMap)) {
+    const tot = Object.values(toMap).reduce((s, c) => s + c, 0);
+    for (const [t, c] of Object.entries(toMap))
+      transRows.push([+f, +t, c, c / tot]);
+  }
+  for (const ch of [transRows.slice(0, 5000), transRows.slice(5000, 10000), transRows.slice(10000)]) {
+    if (!ch.length) continue;
+    await pool.query('INSERT INTO bingo_transition_matrix (from_num,to_num,count,probability) VALUES ?', [ch]);
+  }
+
+  // 計算 co-occurrence
+  const coMap = {};
+  for (const { numbers } of parsed) {
+    const s = [...numbers].sort((a, b) => a - b);
+    for (let a = 0; a < s.length; a++)
+      for (let b = a + 1; b < s.length; b++) {
+        const k = s[a] * 100 + s[b];
+        coMap[k] = (coMap[k] || 0) + 1;
+      }
+  }
+  const coRows = Object.entries(coMap).map(([k, c]) => [Math.floor(+k / 100), +k % 100, c]);
+  for (let i = 0; i < coRows.length; i += 5000) {
+    const ch = coRows.slice(i, i + 5000);
+    if (ch.length) await pool.query('INSERT INTO bingo_cooccurrence (num_a,num_b,count) VALUES ?', [ch]);
+  }
+
+  console.log(`✅ 賓果 analysis rebuilt: ${total} 期, ${transRows.length} 轉移, ${coRows.length} 共現`);
+}
+
+/** 儲存賓果下一期預測 */
+async function saveBingoPrediction() {
+  try {
+    const [rows] = await pool.query(
+      'SELECT draw_no, numbers FROM bingo_draws ORDER BY draw_no DESC LIMIT 120'
+    );
+    if (rows.length === 0) return;
+    const records  = rows.map(r => ({ drawNo: r.draw_no, numbers: Array.isArray(r.numbers)?r.numbers:JSON.parse(r.numbers) }));
+    const nextNo   = records[0].drawNo + 1;
+    const [exists] = await pool.query(
+      'SELECT draw_no FROM bingo_prediction_results WHERE draw_no=?', [nextNo]
+    );
+    if (exists.length > 0) return; // 已儲存
+
+    const work = records.slice(0, 60);
+    const { buildStats, computePredictScores } = require('./routes/bingo_analyze');
+    const { stats, rawFreq, N } = buildStats(work);
+    const sc = computePredictScores(work, stats, rawFreq, N, 'balanced', {}, [], [], []);
+    const recommended = sc.map((v, i) => [i, v]).slice(1)
+      .sort((a, b) => b[1] - a[1]).slice(0, 20).map(([n]) => n).sort((a, b) => a - b);
+
+    await pool.execute(
+      'INSERT IGNORE INTO bingo_prediction_results (draw_no, predicted_numbers) VALUES (?,?)',
+      [nextNo, JSON.stringify(recommended)]
+    );
+    console.log(`🔮 賓果預測已儲存 期號#${nextNo}: [${recommended.join(',')}]`);
+  } catch (e) { console.error('saveBingoPrediction:', e.message); }
+}
+
+/** 抓取最新賓果開獎 → 存入 DB → 更新分析表 */
+async function fetchAndUpdateBingo() {
+  try {
+    const data = await fetchBingoData(10);
+    if (!data?.success || !Array.isArray(data.data)) return;
+
+    for (const item of data.data) {
+      const nums   = (item['一般獎號'] || []).map(n => parseInt(n)).filter(n => n >= 1 && n <= 80).sort((a, b) => a - b);
+      const drawNo = parseInt(item['期數']);
+      if (nums.length < 15 || !drawNo) continue;
+
+      // 檢查是否已存在
+      const [exists] = await pool.query(
+        'SELECT draw_no FROM bingo_draws WHERE draw_no=?', [drawNo]
+      );
+      if (exists.length > 0) continue; // 已有，跳過
+
+      // 取前一期號碼（用於轉移矩陣）
+      const [prevRows] = await pool.query(
+        'SELECT numbers FROM bingo_draws ORDER BY draw_no DESC LIMIT 1'
+      );
+      const prevNums = prevRows.length > 0 ? Array.isArray(prevRows[0].numbers)?prevRows[0].numbers:JSON.parse(prevRows[0].numbers) : [];
+
+      // 寫入 bingo_draws
+      await pool.execute(
+        'INSERT IGNORE INTO bingo_draws (draw_no, numbers, draw_time) VALUES (?,?,?)',
+        [drawNo, JSON.stringify(nums), item['開獎日期'] ? `${item['開獎日期']} ${item['開獎時間']}` : null]
+      );
+
+      // 更新分析表
+      await updateBingoNumberStats(nums, drawNo);
+      await updateBingoTransition(prevNums, nums);
+      await updateBingoCooccurrence(nums);
+
+      // 更新預測結果對照
+      const [pred] = await pool.query(
+        'SELECT predicted_numbers FROM bingo_prediction_results WHERE draw_no=?', [drawNo]
+      );
+      if (pred.length > 0) {
+        const predicted = Array.isArray(pred[0].predicted_numbers)?pred[0].predicted_numbers:JSON.parse(pred[0].predicted_numbers);
+        const hitCount  = nums.filter(n => predicted.includes(n)).length;
+        await pool.execute(
+          'UPDATE bingo_prediction_results SET actual_numbers=?, hit_count=? WHERE draw_no=?',
+          [JSON.stringify(nums), hitCount, drawNo]
+        );
+        console.log(`🎯 賓果對獎 #${drawNo}: 命中 ${hitCount}/20`);
+      }
+
+      console.log(`✅ 賓果新期 #${drawNo}: [${nums.slice(0, 5).join(',')}...] 已儲存`);
+    }
+  } catch (e) { console.error('fetchAndUpdateBingo:', e.message); }
+}
+
+// ── 賓果定時任務：每 5 分鐘存預測，30 秒後抓結果 ───────────────────────────
+cron.schedule('*/5 * * * *', async () => {
+  await saveBingoPrediction();
+  setTimeout(() => fetchAndUpdateBingo(), 30000);
 });
 
 // ════════════════════════════════════════════════════════════════
@@ -1650,16 +1891,232 @@ async function smartFetch539() {
   } catch (e) { console.error('smartFetch539 失敗:', e.message); }
 }
 
+// ════════════════════════════════════════════════════════════════
+// 539 統計分析工具函式
+// ════════════════════════════════════════════════════════════════
+
+/** 從頭重建所有 539 分析表 */
+async function rebuild539Analysis() {
+  const [draws] = await pool.query(
+    'SELECT draw_date, numbers FROM lottery_draws_539 ORDER BY id ASC'
+  );
+  if (draws.length === 0) { console.log('⚠️ lottery_draws_539 無資料'); return; }
+
+  const parsed = draws.map(r => ({ drawDate: r.draw_date, numbers: Array.isArray(r.numbers)?r.numbers:JSON.parse(r.numbers) }));
+  const total  = parsed.length;
+
+  await pool.execute('DELETE FROM lottery_539_number_stats');
+  await pool.execute('DELETE FROM lottery_539_transition');
+  await pool.execute('DELETE FROM lottery_539_cooccurrence');
+  const initVals = Array.from({ length: 39 }, (_, i) => [i + 1, 0, 0, 0, null, 0]);
+  await pool.query(
+    'INSERT INTO lottery_539_number_stats (number, times_drawn, current_miss, max_miss, last_drawn_date, total_draws) VALUES ?',
+    [initVals]
+  );
+
+  // number_stats
+  const nd = {};
+  for (let n = 1; n <= 39; n++) nd[n] = { td: 0, cm: 0, mm: 0, ld: null, run: 0 };
+  for (const { drawDate, numbers } of parsed) {
+    const ns = new Set(numbers);
+    for (let n = 1; n <= 39; n++) {
+      const d = nd[n];
+      if (ns.has(n)) { d.td++; if (d.run > d.mm) d.mm = d.run; d.run = 0; d.ld = drawDate; }
+      else           { d.run++; }
+    }
+  }
+  await Promise.all(Array.from({ length: 39 }, (_, i) => i + 1).map(n => {
+    const d = nd[n]; const cm = d.run; if (cm > d.mm) d.mm = cm;
+    return pool.execute(
+      'UPDATE lottery_539_number_stats SET times_drawn=?,current_miss=?,max_miss=?,last_drawn_date=?,total_draws=? WHERE number=?',
+      [d.td, cm, d.mm, d.ld, total, n]
+    );
+  }));
+
+  // transition_matrix
+  const transMap = {};
+  for (let i = 1; i < parsed.length; i++) {
+    for (const f of parsed[i - 1].numbers) {
+      if (!transMap[f]) transMap[f] = {};
+      for (const t of parsed[i].numbers)
+        transMap[f][t] = (transMap[f][t] || 0) + 1;
+    }
+  }
+  const transRows = [];
+  for (const [f, toMap] of Object.entries(transMap)) {
+    const tot = Object.values(toMap).reduce((s, c) => s + c, 0);
+    for (const [t, c] of Object.entries(toMap))
+      transRows.push([+f, +t, c, c / tot]);
+  }
+  if (transRows.length > 0)
+    await pool.query('INSERT INTO lottery_539_transition (from_num,to_num,count,probability) VALUES ?', [transRows]);
+
+  // co-occurrence
+  const coMap = {};
+  for (const { numbers } of parsed) {
+    const s = [...numbers].sort((a, b) => a - b);
+    for (let a = 0; a < s.length; a++)
+      for (let b = a + 1; b < s.length; b++) {
+        const k = s[a] * 100 + s[b];
+        coMap[k] = (coMap[k] || 0) + 1;
+      }
+  }
+  const coRows = Object.entries(coMap).map(([k, c]) => [Math.floor(+k / 100), +k % 100, c]);
+  if (coRows.length > 0)
+    await pool.query('INSERT INTO lottery_539_cooccurrence (num_a,num_b,count) VALUES ?', [coRows]);
+
+  console.log(`✅ 539 analysis rebuilt: ${total} 期, ${transRows.length} 轉移, ${coRows.length} 共現`);
+}
+
+/** 儲存 539 預測（在開獎前觸發，drawDate 為今日） */
+async function save539Prediction(drawDate) {
+  try {
+    const [exists] = await pool.query(
+      'SELECT draw_date FROM lottery_539_prediction_results WHERE draw_date=?', [drawDate]
+    );
+    if (exists.length > 0) return;
+
+    const [rows] = await pool.query(
+      'SELECT draw_date, numbers FROM lottery_draws_539 ORDER BY id DESC LIMIT 80'
+    );
+    if (rows.length === 0) return;
+
+    const records = rows.map(r => ({ drawDate: r.draw_date, numbers: Array.isArray(r.numbers)?r.numbers:JSON.parse(r.numbers) }));
+    const { buildLotteryStats, scoreNumbers } = require('./routes/lottery_predict');
+    const work = records.slice(0, 50);
+    const { stats, freq, N } = buildLotteryStats(work);
+    const sc   = scoreNumbers(work, stats, freq, N);
+    const recommended = sc.map((v, i) => [i, v]).slice(1)
+      .sort((a, b) => b[1] - a[1]).slice(0, 5).map(([n]) => n).sort((a, b) => a - b);
+
+    await pool.execute(
+      'INSERT IGNORE INTO lottery_539_prediction_results (draw_date, predicted_numbers) VALUES (?,?)',
+      [drawDate, JSON.stringify(recommended)]
+    );
+    console.log(`🔮 539 預測已儲存 [${drawDate}]: [${recommended.join(',')}]`);
+  } catch (e) { console.error('save539Prediction:', e.message); }
+}
+
+/** 增量更新 539 分析表（每次新開獎後呼叫） */
+async function update539Analysis(drawDate, newNums) {
+  const numSet = new Set(newNums);
+
+  // number_stats
+  const drawn  = newNums;
+  const missed = Array.from({ length: 39 }, (_, i) => i + 1).filter(n => !numSet.has(n));
+  if (drawn.length > 0) {
+    await pool.execute(
+      `UPDATE lottery_539_number_stats
+       SET times_drawn=times_drawn+1, max_miss=GREATEST(max_miss,current_miss),
+           current_miss=0, last_drawn_date=?, total_draws=total_draws+1
+       WHERE number IN (${drawn.map(() => '?').join(',')})`,
+      [drawDate, ...drawn]
+    );
+  }
+  if (missed.length > 0) {
+    await pool.execute(
+      `UPDATE lottery_539_number_stats
+       SET current_miss=current_miss+1, max_miss=GREATEST(max_miss,current_miss+1),
+           total_draws=total_draws+1
+       WHERE number IN (${missed.map(() => '?').join(',')})`,
+      missed
+    );
+  }
+
+  // transition（前一期 → 當期）
+  const [prevRow] = await pool.query(
+    'SELECT numbers FROM lottery_draws_539 ORDER BY id DESC LIMIT 1,1'
+  );
+  if (prevRow.length > 0) {
+    const prevNums = Array.isArray(prevRow[0].numbers)?prevRow[0].numbers:JSON.parse(prevRow[0].numbers);
+    const pairs    = [];
+    for (const f of prevNums) for (const t of newNums) pairs.push([f, t]);
+    if (pairs.length > 0) {
+      await pool.execute(
+        `INSERT INTO lottery_539_transition (from_num,to_num,count) VALUES ${pairs.map(() => '(?,?,1)').join(',')}
+         ON DUPLICATE KEY UPDATE count=count+1`,
+        pairs.flat()
+      );
+      for (const f of new Set(prevNums)) {
+        const [[row]] = await pool.query(
+          'SELECT SUM(count) as total FROM lottery_539_transition WHERE from_num=?', [f]
+        );
+        if (row.total) await pool.execute(
+          'UPDATE lottery_539_transition SET probability=count/? WHERE from_num=?', [row.total, f]
+        );
+      }
+    }
+  }
+
+  // co-occurrence
+  const s = [...newNums].sort((a, b) => a - b);
+  const coPairs = [];
+  for (let a = 0; a < s.length; a++)
+    for (let b = a + 1; b < s.length; b++) coPairs.push([s[a], s[b]]);
+  if (coPairs.length > 0) {
+    await pool.execute(
+      `INSERT INTO lottery_539_cooccurrence (num_a,num_b,count) VALUES ${coPairs.map(() => '(?,?,1)').join(',')}
+       ON DUPLICATE KEY UPDATE count=count+1`,
+      coPairs.flat()
+    );
+  }
+}
+
+// 每天 20:30（週一至週六）存預測
+cron.schedule('30 20 * * 1-6', async () => {
+  const now   = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Taipei' }));
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day   = String(now.getDate()).padStart(2, '0');
+  await save539Prediction(`${month}/${day}`);
+}, { timezone: 'Asia/Taipei' });
+
 // 每天 20:35（週一至週六）自動抓取 539 開獎並對獎（539 週一~週六 20:30 開獎）
 cron.schedule('35 20 * * 1-6', async () => {
   console.log('⏰ 539 定時開獎抓取...');
   await fetch539AndCompare({ maxPages: 1 });
+
+  // 找出今日開獎，更新 539 分析表 + 預測對照
+  const now   = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Taipei' }));
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day   = String(now.getDate()).padStart(2, '0');
+  const today = `${month}/${day}`;
+
+  const [rows] = await pool.query(
+    'SELECT numbers FROM lottery_draws_539 WHERE draw_date=? LIMIT 1', [today]
+  );
+  if (rows.length > 0) {
+    const nums = JSON.parse(rows[0].numbers);
+    await update539Analysis(today, nums);
+
+    const [pred] = await pool.query(
+      'SELECT predicted_numbers FROM lottery_539_prediction_results WHERE draw_date=?', [today]
+    );
+    if (pred.length > 0) {
+      const predicted = Array.isArray(pred[0].predicted_numbers)?pred[0].predicted_numbers:JSON.parse(pred[0].predicted_numbers);
+      const hitCount  = nums.filter(n => predicted.includes(n)).length;
+      await pool.execute(
+        'UPDATE lottery_539_prediction_results SET actual_numbers=?, hit_count=? WHERE draw_date=?',
+        [JSON.stringify(nums), hitCount, today]
+      );
+      console.log(`🎯 539 對獎 [${today}]: 命中 ${hitCount}/5`);
+    }
+  }
 }, { timezone: 'Asia/Taipei' });
 
 // 每天 09:00 也補抓昨日結果（防止前晚失敗）
 cron.schedule('0 9 * * *', async () => {
   await smartFetch539();
 }, { timezone: 'Asia/Taipei' });
+
+// 手動觸發：POST /api/analysis/rebuild — 重建所有分析表
+app.post('/api/analysis/rebuild', async (req, res) => {
+  const type = req.body?.type || 'all'; // 'bingo' | '539' | 'all'
+  try {
+    if (type === 'bingo' || type === 'all') await rebuildBingoAnalysis();
+    if (type === '539'  || type === 'all') await rebuild539Analysis();
+    res.json({ ok: true, rebuilt: type });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // 手動觸發：POST /api/lottery/539/sync-now
 // body: { fullSync: true } 可強制補全多頁
@@ -1894,6 +2351,13 @@ cleanupExpiredPredictions(); // 啟動時執行一次
 
 // 啟動時智能補抓 539（30 秒後，根據 DB 落後天數自動決定頁數）
 setTimeout(() => smartFetch539().catch(() => {}), 30 * 1000);
+
+// 啟動時重建分析表（60 秒後，不影響主流程啟動）
+setTimeout(async () => {
+  console.log('🔄 啟動分析資料重建...');
+  try { await rebuild539Analysis(); } catch (e) { console.error('539 rebuild failed:', e.message); }
+  try { await rebuildBingoAnalysis(); } catch (e) { console.error('bingo rebuild failed:', e.message); }
+}, 60 * 1000);
 
 // ── 啟動（TLS 優先，找不到憑證則降回 HTTP）────────────────────
 const PORT      = parseInt(process.env.PORT  || '3000');

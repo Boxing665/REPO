@@ -306,7 +306,7 @@ router.post('/analyze', async (req, res) => {
       );
       records = rows.map(r => ({
         drawNo: r.draw_no,
-        numbers: JSON.parse(r.numbers),
+        numbers: Array.isArray(r.numbers) ? r.numbers : JSON.parse(r.numbers),
         drawTime: r.draw_time,
       }));
     }
@@ -362,4 +362,7 @@ router.post('/analyze', async (req, res) => {
   }
 });
 
+// ── 匯出核心函式供 server.js cron 和 analysis.js 使用 ────────────────────────
+router.buildStats           = buildStats;
+router.computePredictScores = computePredictScores;
 module.exports = router;

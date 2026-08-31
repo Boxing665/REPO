@@ -113,3 +113,80 @@ SET @sql3 = IF(@idx=0,
   'ALTER TABLE prediction_logs ADD INDEX idx_expires (expires_at)',
   'SELECT 1');
 PREPARE stmt3 FROM @sql3; EXECUTE stmt3; DEALLOCATE PREPARE stmt3;
+
+-- ── 2025-analysis: 賓果 + 539 統計分析表 ─────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS bingo_number_stats (
+  number       TINYINT UNSIGNED NOT NULL PRIMARY KEY,
+  times_drawn  INT UNSIGNED NOT NULL DEFAULT 0,
+  current_miss INT UNSIGNED NOT NULL DEFAULT 0,
+  max_miss     INT UNSIGNED NOT NULL DEFAULT 0,
+  last_drawn_no INT UNSIGNED DEFAULT NULL,
+  total_draws  INT UNSIGNED NOT NULL DEFAULT 0,
+  updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='賓果 1-80 每期統計';
+
+CREATE TABLE IF NOT EXISTS bingo_transition_matrix (
+  from_num    TINYINT UNSIGNED NOT NULL,
+  to_num      TINYINT UNSIGNED NOT NULL,
+  count       INT UNSIGNED NOT NULL DEFAULT 0,
+  probability FLOAT NOT NULL DEFAULT 0,
+  PRIMARY KEY (from_num, to_num),
+  INDEX idx_from (from_num),
+  INDEX idx_prob (probability DESC)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='賓果轉移機率矩陣';
+
+CREATE TABLE IF NOT EXISTS bingo_cooccurrence (
+  num_a TINYINT UNSIGNED NOT NULL,
+  num_b TINYINT UNSIGNED NOT NULL,
+  count INT UNSIGNED NOT NULL DEFAULT 0,
+  PRIMARY KEY (num_a, num_b),
+  INDEX idx_a (num_a),
+  INDEX idx_count (count DESC)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='賓果號碼共現次數';
+
+CREATE TABLE IF NOT EXISTS bingo_prediction_results (
+  draw_no          INT UNSIGNED NOT NULL PRIMARY KEY,
+  predicted_numbers JSON NOT NULL,
+  actual_numbers    JSON DEFAULT NULL,
+  hit_count         TINYINT UNSIGNED DEFAULT NULL,
+  created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_hit (hit_count DESC)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='賓果預測 vs 實際對照';
+
+CREATE TABLE IF NOT EXISTS lottery_539_number_stats (
+  number       TINYINT UNSIGNED NOT NULL PRIMARY KEY,
+  times_drawn  INT UNSIGNED NOT NULL DEFAULT 0,
+  current_miss INT UNSIGNED NOT NULL DEFAULT 0,
+  max_miss     INT UNSIGNED NOT NULL DEFAULT 0,
+  last_drawn_date VARCHAR(10) DEFAULT NULL,
+  total_draws  INT UNSIGNED NOT NULL DEFAULT 0,
+  updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='539 1-39 每期統計';
+
+CREATE TABLE IF NOT EXISTS lottery_539_transition (
+  from_num    TINYINT UNSIGNED NOT NULL,
+  to_num      TINYINT UNSIGNED NOT NULL,
+  count       INT UNSIGNED NOT NULL DEFAULT 0,
+  probability FLOAT NOT NULL DEFAULT 0,
+  PRIMARY KEY (from_num, to_num),
+  INDEX idx_from (from_num)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='539 轉移機率矩陣';
+
+CREATE TABLE IF NOT EXISTS lottery_539_cooccurrence (
+  num_a TINYINT UNSIGNED NOT NULL,
+  num_b TINYINT UNSIGNED NOT NULL,
+  count INT UNSIGNED NOT NULL DEFAULT 0,
+  PRIMARY KEY (num_a, num_b),
+  INDEX idx_a (num_a)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='539 號碼共現次數';
+
+CREATE TABLE IF NOT EXISTS lottery_539_prediction_results (
+  draw_date         VARCHAR(10) NOT NULL PRIMARY KEY,
+  predicted_numbers JSON NOT NULL,
+  actual_numbers    JSON DEFAULT NULL,
+  hit_count         TINYINT UNSIGNED DEFAULT NULL,
+  created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='539 預測 vs 實際對照';
