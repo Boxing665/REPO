@@ -565,8 +565,7 @@ app.get('/api/sports/matches', async (req, res) => {
     const params = [];
     if (sport)  { sql += ' AND sport_type = ?'; params.push(sport); }
     if (status) { sql += ' AND status = ?'; params.push(status); }
-    sql += ' ORDER BY match_time DESC LIMIT ?';
-    params.push(parseInt(limit));
+    sql += ` ORDER BY match_time DESC LIMIT ${parseInt(limit)}`;
     const [rows] = await pool.execute(sql, params);
     res.json(rows.map(r => ({
       ...r,
