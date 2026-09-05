@@ -2462,6 +2462,191 @@ setTimeout(async () => {
   try { await rebuildBingoAnalysis(); } catch (e) { console.error('bingo rebuild failed:', e.message); }
 }, 60 * 1000);
 
+// ════════════════════════════════════════════════════════════════
+// TheSportsDB 體育賽事同步（免費公開 API，無需 key）
+// ════════════════════════════════════════════════════════════════
+
+const SPORTSDB_BASE = 'https://www.thesportsdb.com/api/v1/json/3';
+const MLB_API_BASE  = 'https://statsapi.mlb.com/api/v1';
+
+// TheSportsDB 聯賽名稱對應
+const SPORTSDB_LEAGUE_MAP = {
+  'English Premier League':       { league: 'EPL',          sport: 'football' },
+  'Spanish La Liga':              { league: 'La Liga',       sport: 'football' },
+  'Italian Serie A':              { league: 'Serie A',       sport: 'football' },
+  'German Bundesliga':            { league: 'Bundesliga',    sport: 'football' },
+  'French Ligue 1':               { league: 'Ligue 1',       sport: 'football' },
+  'Japanese J1 League':           { league: 'J1',            sport: 'football' },
+  'American Major League Soccer': { league: 'MLS',           sport: 'football' },
+  'Portuguese Primeira Liga':     { league: 'Primeira Liga', sport: 'football' },
+  'NBA':                          { league: 'NBA',           sport: 'basketball' },
+  'FIBA Basketball World Cup':    { league: 'FIBA',          sport: 'basketball' },
+};
+
+// MLB Stats API sport IDs
+// id=1: MLB, id=31: NPB（日本職棒）, id=32: KBO（韓國職棒）
+// 注意：MLB Stats API 無 CPBL（中華職棒）；TheSportsDB 也無 CPBL 資料
+const MLB_SPORT_IDS = [
+  { id: 1,  league: 'MLB',  sport: 'baseball' },
+  { id: 31, league: 'NPB',  sport: 'baseball' },
+  { id: 32, league: 'KBO',  sport: 'baseball' },
+];
+
+function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function sportsdbFetch(url) {
+  return new Promise((resolve) => {
+    https.get(url, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Referer': 'https://www.thesportsdb.com/',
+      },
+    }, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
+    }).on('error', () => resolve(null));
+  });
+}
+
+function toMysqlDatetime(isoStr) {
+  if (!isoStr) return null;
+  return new Date(isoStr).toISOString().slice(0, 19).replace('T', ' ');
+}
+
+async function upsertMatch(id, homeTeam, awayTeam, league, sport, matchTime, homeScore, awayScore, status) {
+  if (!id || !homeTeam || !awayTeam) return false;
+  try {
+    await pool.execute(
+      `INSERT INTO sports_matches
+         (id, home_team, away_team, league, sport_type, match_time, home_score, away_score, status)
+       VALUES (?,?,?,?,?,?,?,?,?)
+       ON DUPLICATE KEY UPDATE
+         home_score = COALESCE(VALUES(home_score), home_score),
+         away_score = COALESCE(VALUES(away_score), away_score),
+         status     = VALUES(status),
+         updated_at = NOW()`,
+      [id, homeTeam, awayTeam, league, sport, matchTime, homeScore ?? null, awayScore ?? null, status]
+    );
+    return true;
+  } catch (e) {
+    console.error('upsertMatch error:', e.message, { id, matchTime });
+    return false;
+  }
+}
+
+// ── 來源1：MLB Stats API（官方免費，最穩定）──────────────────
+async function fetchBaseballFromMlbApi(dates) {
+  let saved = 0;
+  const startDate = dates[0];
+  const endDate   = dates[dates.length - 1];
+
+  for (const sp of MLB_SPORT_IDS) {
+    const url = `${MLB_API_BASE}/schedule?sportId=${sp.id}&startDate=${startDate}&endDate=${endDate}&hydrate=team,linescore`;
+    const data = await fetchJson(url);
+    if (!data?.dates) continue;
+
+    for (const dt of data.dates) {
+      for (const g of (dt.games || [])) {
+        const id = `mlb_${g.gamePk}`;
+        const home = g.teams?.home?.team?.name || '';
+        const away = g.teams?.away?.team?.name || '';
+        const hs   = g.teams?.home?.score ?? null;
+        const as_  = g.teams?.away?.score ?? null;
+        const state = g.status?.abstractGameState || '';
+        const status = state === 'Final' ? 'finished'
+                     : state === 'Live'  ? 'live'
+                     : 'scheduled';
+        const matchTime = toMysqlDatetime(g.gameDate);
+        if (await upsertMatch(id, home, away, sp.league, sp.sport, matchTime, hs, as_, status)) saved++;
+      }
+    }
+    await delay(300);
+  }
+  return saved;
+}
+
+// ── 來源2：TheSportsDB（足球 + 籃球，加延遲避免限速）────────
+async function fetchSoccerBasketballFromSportsDB(dates) {
+  let saved = 0;
+  const sports = ['Soccer', 'Basketball'];
+
+  for (const sport of sports) {
+    for (const date of dates) {
+      await delay(1200); // 避免 Cloudflare 1015
+      const url = `${SPORTSDB_BASE}/eventsday.php?d=${date}&s=${sport}`;
+      const data = await sportsdbFetch(url);
+      if (!data?.events) continue;
+
+      for (const ev of data.events) {
+        const leagueInfo = SPORTSDB_LEAGUE_MAP[ev.strLeague?.trim()];
+        if (!leagueInfo) continue;
+
+        const id        = `sdb_${ev.idEvent}`;
+        const matchTime = toMysqlDatetime(ev.strTimestamp);
+        const hs = ev.intHomeScore != null && ev.intHomeScore !== '' ? parseInt(ev.intHomeScore) : null;
+        const as_ = ev.intAwayScore != null && ev.intAwayScore !== '' ? parseInt(ev.intAwayScore) : null;
+        const raw = (ev.strStatus || '').toUpperCase();
+        const status = ['FT','AET','PEN'].includes(raw) ? 'finished'
+                     : raw === 'NS' ? 'scheduled'
+                     : raw.length > 0 ? 'live'
+                     : 'scheduled';
+
+        if (await upsertMatch(id, ev.strHomeTeam, ev.strAwayTeam, leagueInfo.league, leagueInfo.sport, matchTime, hs, as_, status)) saved++;
+      }
+    }
+  }
+  return saved;
+}
+
+async function fetchAndStoreSportsMatches() {
+  // 抓取昨天、今天、明天、後天（台灣 UTC+8 日期）
+  const twNow = new Date(Date.now() + 8 * 3600000);
+  const dates = [-1, 0, 1, 2].map(offset => {
+    const d = new Date(twNow);
+    d.setUTCDate(d.getUTCDate() + offset);
+    return d.toISOString().slice(0, 10);
+  });
+
+  const [baseball, soccer] = await Promise.all([
+    fetchBaseballFromMlbApi(dates),
+    fetchSoccerBasketballFromSportsDB(dates),
+  ]);
+  return baseball + soccer;
+}
+
+// 每2小時自動同步體育賽事
+cron.schedule('0 */2 * * *', async () => {
+  console.log('⏰ 體育賽事同步中（MLB Stats API + TheSportsDB）...');
+  try {
+    const n = await fetchAndStoreSportsMatches();
+    console.log(`✅ 體育同步完成，共 ${n} 筆 upsert`);
+  } catch (e) {
+    console.error('❌ 體育同步失敗:', e.message);
+  }
+}, { timezone: 'Asia/Taipei' });
+
+// 手動觸發：POST /api/sports/sync-now
+app.post('/api/sports/sync-now', async (req, res) => {
+  try {
+    const n = await fetchAndStoreSportsMatches();
+    res.json({ success: true, upserted: n });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 啟動後立刻跑一次
+setTimeout(async () => {
+  try {
+    const n = await fetchAndStoreSportsMatches();
+    console.log(`🏟️ 啟動體育同步完成，共 ${n} 筆`);
+  } catch (e) {
+    console.error('啟動體育同步失敗:', e.message);
+  }
+}, 5000);
+
 // ── 啟動（TLS 優先，找不到憑證則降回 HTTP）────────────────────
 const PORT      = parseInt(process.env.PORT  || '3000');
 const HTTPS_PORT = parseInt(process.env.HTTPS_PORT || '3443');
