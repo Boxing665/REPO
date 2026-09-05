@@ -266,3 +266,32 @@ CREATE TABLE IF NOT EXISTS prediction_analysis_detail (
   INDEX idx_expires (expires_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   COMMENT='每筆預測的完整分析邏輯快照 — 保留8天，自動清除';
+
+-- ── 冠軍小隊：每日分析師/A/B/C對錯結果（App每天寫入，供週一結算用）──
+CREATE TABLE IF NOT EXISTS champion_daily_results (
+  id           INT AUTO_INCREMENT PRIMARY KEY,
+  result_date  DATE         NOT NULL              COMMENT '該筆結果對應的日期',
+  category     VARCHAR(20)  NOT NULL              COMMENT '539 / bingo / sport',
+  competitor   VARCHAR(10)  NOT NULL              COMMENT 'analyst / A / B / C',
+  result       VARCHAR(20)  NOT NULL              COMMENT 'correct / partial / incorrect',
+  created_at   DATETIME     DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_date_cat_competitor (result_date, category, competitor),
+  INDEX idx_result_date (result_date DESC)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  COMMENT='冠軍小隊每日對錯結果，週一9點cron依此結算週冠軍';
+
+-- ── 冠軍小隊：每週結算冠軍（週一9點cron寫入）──────────────────────
+CREATE TABLE IF NOT EXISTS weekly_champion (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  week_start    DATE         NOT NULL             COMMENT '該週週一日期',
+  category      VARCHAR(20)  NOT NULL             COMMENT '539 / bingo / sport',
+  champion      VARCHAR(20)  NOT NULL             COMMENT 'analyst / A / B / C / 平手',
+  analyst_score INT          DEFAULT 0,
+  a_score       INT          DEFAULT 0,
+  b_score       INT          DEFAULT 0,
+  c_score       INT          DEFAULT 0,
+  created_at    DATETIME     DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_week_category (week_start, category),
+  INDEX idx_week_start (week_start DESC)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  COMMENT='冠軍小隊每週三大類（539/賓果/體育）各自冠軍結算結果';

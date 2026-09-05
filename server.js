@@ -1350,6 +1350,110 @@ app.get('/api/predictions/weekly-summary', async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════
+// 冠軍小隊：539 / 賓果 / 體育 分析師+A/B/C 每日結果同步 + 週一結算
+// ════════════════════════════════════════════════════════════════
+
+const CHAMPION_CATEGORIES = ['539', 'bingo', 'sport'];
+const CHAMPION_COMPETITORS = ['analyst', 'A', 'B', 'C'];
+
+// App 每天算完當天分析師/A/B/C對不對後同步一筆（可一次多筆 batch）
+// body: { results: [{ date, category, competitor, result }] }
+app.post('/api/predictions/champion-daily', async (req, res) => {
+  const results = Array.isArray(req.body?.results) ? req.body.results : [];
+  if (!results.length) return res.status(400).json({ error: 'results required' });
+  try {
+    let saved = 0;
+    for (const r of results) {
+      if (!CHAMPION_CATEGORIES.includes(r.category) || !CHAMPION_COMPETITORS.includes(r.competitor)) continue;
+      if (!['correct', 'partial', 'incorrect'].includes(r.result)) continue;
+      await pool.execute(
+        `INSERT INTO champion_daily_results (result_date, category, competitor, result)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE result = VALUES(result)`,
+        [r.date, r.category, r.competitor, r.result]
+      );
+      saved++;
+    }
+    res.json({ ok: true, saved });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// App 開啟時讀取最新一期三大類冠軍，塞進跑馬燈
+app.get('/api/predictions/weekly-champion', async (req, res) => {
+  try {
+    const [rows] = await pool.execute(
+      `SELECT category, champion, analyst_score, a_score, b_score, c_score, week_start
+       FROM weekly_champion
+       WHERE week_start = (SELECT MAX(week_start) FROM weekly_champion)`
+    );
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 依 correct=+3 partial=+1 incorrect=-1 結算 [weekStart, weekStart+7) 區間分數，取最高分為冠軍
+async function settleChampionWeek(weekStartStr) {
+  const weekEnd = new Date(weekStartStr);
+  weekEnd.setDate(weekEnd.getDate() + 7);
+  const weekEndStr = weekEnd.toISOString().slice(0, 10);
+
+  for (const category of CHAMPION_CATEGORIES) {
+    const [rows] = await pool.execute(
+      `SELECT competitor, result FROM champion_daily_results
+       WHERE category = ? AND result_date >= ? AND result_date < ?`,
+      [category, weekStartStr, weekEndStr]
+    );
+    const scores = { analyst: 0, A: 0, B: 0, C: 0 };
+    for (const r of rows) {
+      const delta = r.result === 'correct' ? 3 : r.result === 'partial' ? 1 : -1;
+      scores[r.competitor] = (scores[r.competitor] || 0) + delta;
+    }
+    const maxScore = Math.max(...Object.values(scores));
+    const leaders = Object.keys(scores).filter(k => scores[k] === maxScore);
+    const champion = (rows.length === 0) ? '無資料' : (leaders.length > 1 ? '平手' : leaders[0]);
+
+    await pool.execute(
+      `INSERT INTO weekly_champion (week_start, category, champion, analyst_score, a_score, b_score, c_score)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         champion = VALUES(champion), analyst_score = VALUES(analyst_score),
+         a_score = VALUES(a_score), b_score = VALUES(b_score), c_score = VALUES(c_score)`,
+      [weekStartStr, category, champion, scores.analyst, scores.A, scores.B, scores.C]
+    );
+  }
+}
+
+// 每週一 09:00（台灣時間）結算上週（前一個週一~週日）冠軍
+cron.schedule('0 9 * * 1', async () => {
+  console.log('⏰ 冠軍小隊：週一結算上週冠軍...');
+  try {
+    const now = new Date();
+    const lastMonday = new Date(now);
+    lastMonday.setDate(now.getDate() - 7);
+    const day = lastMonday.getDay();
+    lastMonday.setDate(lastMonday.getDate() - (day === 0 ? 6 : day - 1));
+    lastMonday.setHours(0, 0, 0, 0);
+    await settleChampionWeek(lastMonday.toISOString().slice(0, 10));
+    console.log('  ✅ 冠軍小隊週結算完成');
+  } catch (e) { console.error('冠軍小隊週結算失敗:', e.message); }
+}, { timezone: 'Asia/Taipei' });
+
+// 手動觸發結算（測試/補算用）：POST /api/predictions/champion-settle-now { weekStart: 'YYYY-MM-DD' }
+app.post('/api/predictions/champion-settle-now', async (req, res) => {
+  try {
+    const weekStart = req.body?.weekStart;
+    if (!weekStart) return res.status(400).json({ error: 'weekStart required (該週週一日期)' });
+    await settleChampionWeek(weekStart);
+    res.json({ ok: true, weekStart });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
 // 預測詳細分析紀錄
 // ════════════════════════════════════════════════════════════════
 
